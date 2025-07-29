@@ -66,6 +66,7 @@
 
 import { Command } from 'commander';
 import { Octokit } from 'octokit';
+import fs from 'fs'
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import chalk from 'chalk';
@@ -210,7 +211,6 @@ class AssociatedRepos {
     if (this.logFile) {
       const logLine = JSON.stringify(logEntry) + '\n';
       try {
-        const fs = await import('fs');
         fs.appendFileSync(this.logFile, logLine);
       } catch (err) {
         console.error('Failed to write to log file:', err.message);
