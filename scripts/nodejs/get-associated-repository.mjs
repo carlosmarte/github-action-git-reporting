@@ -4,6 +4,25 @@
  * Purpose: Query GitHub API to provide comprehensive list of associated repositories (public/private) for users
  * Description: A robust CLI tool that analyzes GitHub repositories associated with users from CSV input or single user search,
  *              providing detailed reporting on repository ownership, contributions, and metadata
+
+    # Basic team analysis
+    node main.mjs --csvFile users.csv --format json --outputDir ./reports
+
+    # Comprehensive team analysis with date range
+    node main.mjs --csvFile team-members.csv --start 2024-01-01 --end 2024-12-31 --verbose
+
+    # Security audit with metadata
+    node main.mjs --csvFile security-audit.csv --ignoreDateRange --debug --meta-tags audit=security review-date=2024-12-01
+
+    # Organization-specific analysis
+    node main.mjs --csvFile team-members.csv --org github --format csv
+
+    # Contributors analysis for specific repositories
+    node main.mjs --csvFile contributors.csv --repo "git,jekyll,express" --start 2024-01-01
+
+    # Large-scale analysis with rate limiting
+    node main.mjs --csvFile large-team.csv --delay 3 --totalRecords 1000 --outputDir ./large-analysis
+
  * Requirements Summary:
  *   - Parse CSV file containing user identifiers or analyze single user via --searchUser
  *   - Query GitHub API for associated repositories (public/private)
