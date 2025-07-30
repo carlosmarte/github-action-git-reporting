@@ -1,762 +1,882 @@
-// main.mjs
+#!/usr/bin/env node
+
 /**
- * Project Name: Associated Repos Analyzer
- * Purpose: Query GitHub API to provide comprehensive list of associated repositories (public/private) for users
- * Description: A robust CLI tool that analyzes GitHub repositories associated with users from CSV input or single user search,
- *              providing detailed reporting on repository ownership, contributions, and metadata
-
-    # Basic team analysis
-    node main.mjs --csvFile users.csv --format json --outputDir ./reports
-
-    # Comprehensive team analysis with date range
-    node main.mjs --csvFile team-members.csv --start 2024-01-01 --end 2024-12-31 --verbose
-
-    # Security audit with metadata
-    node main.mjs --csvFile security-audit.csv --ignoreDateRange --debug --meta-tags audit=security review-date=2024-12-01
-
-    # Organization-specific analysis
-    node main.mjs --csvFile team-members.csv --org github --format csv
-
-    # Contributors analysis for specific repositories
-    node main.mjs --csvFile contributors.csv --repo "git,jekyll,express" --start 2024-01-01
-
-    # Large-scale analysis with rate limiting
-    node main.mjs --csvFile large-team.csv --delay 3 --totalRecords 1000 --outputDir ./large-analysis
-
+ * Project: Associated Repositories Analyzer
+ * Purpose: Analyze GitHub users from CSV input and discover all associated repositories (public/private)
+ * Description: This tool reads a CSV file containing GitHub usernames and systematically discovers all repositories 
+ *              associated with each user, including owned repos, contributed repos, and organizational memberships.
+ *              Features real-time streaming to prevent data loss and comprehensive progress tracking.
+ * 
  * Requirements Summary:
- *   - Parse CSV file containing user identifiers or analyze single user via --searchUser
- *   - Query GitHub API for associated repositories (public/private)
- *   - Handle pagination, rate limiting, and API errors gracefully
- *   - Generate comprehensive reports in JSON/CSV format with metadata
- *   - Support filtering by organization, repository, and date ranges
- *   - Provide detailed audit logging and GitHub API usage tracking
+ * - Read users from CSV file (flexible column mapping)
+ * - Discover all associated repositories for each user
+ * - Stream results to file in real-time to prevent data loss
+ * - Support both JSON and CSV output formats
+ * - Handle rate limiting and API errors gracefully
+ * - Provide detailed progress tracking and logging
  * 
  * JSON Report Structure Example:
  * {
- *   "inputs": { "csvFile": "users.csv", "format": "json", "start": "2024-01-01", "end": "2024-12-31" },
- *   "metaTags": { "project": "analysis-2024", "team": "dev-ops" },
- *   "summary": {
- *     "totalUsers": 5,
- *     "totalRepositories": 45,
- *     "publicRepos": 40,
- *     "privateRepos": 5,
- *     "organizationRepos": 12,
- *     "personalRepos": 33
- *   },
+ *   "inputs": { "csvFile": "users.csv", "format": "json", "totalUsers": 5 },
+ *   "summary": { "totalUsers": 5, "totalRepositories": 847, "successfulAnalyses": 5, "failedAnalyses": 0 },
+ *   "metaTags": {},
  *   "users": [
  *     {
- *       "username": "johndoe",
- *       "profile": { "name": "John Doe", "email": "john@example.com", "company": "Tech Corp" },
- *       "repositories": [
- *         {
- *           "name": "awesome-project",
- *           "fullName": "johndoe/awesome-project",
- *           "private": false,
- *           "owner": "johndoe",
- *           "description": "An awesome project",
- *           "language": "JavaScript",
- *           "stars": 150,
- *           "forks": 25,
- *           "createdAt": "2024-01-15T10:30:00Z",
- *           "updatedAt": "2024-06-20T14:45:00Z",
- *           "url": "https://github.com/johndoe/awesome-project"
- *         }
- *       ],
- *       "repositoryStats": {
- *         "total": 8,
- *         "public": 7,
- *         "private": 1,
- *         "byLanguage": { "JavaScript": 4, "Python": 3, "Go": 1 }
- *       }
+ *       "user": "octocat",
+ *       "userData": { "login": "octocat", "name": "The Octocat" },
+ *       "repositories": {
+ *         "owned": [{ "name": "Hello-World", "fullName": "octocat/Hello-World", "private": false }],
+ *         "contributed": [],
+ *         "organizations": []
+ *       },
+ *       "totals": { "ownedCount": 1, "contributedCount": 0, "organizationRepoCount": 0, "totalRepoCount": 1 }
  *     }
- *   ],
- *   "criteria": ["Active repositories", "Date range filter applied", "Public and private repos included"],
- *   "formula": ["Repository count = owned + contributed", "Language distribution by primary language"],
- *   "insights": ["Most active language: JavaScript", "Average repositories per user: 9", "High collaboration indicated by fork counts"]
+ *   ]
  * }
  * 
  * Potential Insights:
- * - Repository ownership patterns and activity levels
- * - Programming language preferences and expertise areas
- * - Collaboration patterns through forks and contributions
- * - Organization vs personal repository distribution
- * - Repository creation and update activity over time
+ * - Repository ownership patterns across team members
+ * - Public vs private repository distributions
+ * - Cross-organizational collaboration analysis
+ * - Developer productivity and contribution patterns
+ * - Security audit trail for repository access
  */
 
 import { Command } from 'commander';
 import { Octokit } from 'octokit';
-import fs from 'fs'
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
-import { join, dirname } from 'path';
 import chalk from 'chalk';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { createReadStream, createWriteStream } from 'fs';
+import { parse } from 'csv-parse';
+import { stringify } from 'csv-stringify';
+import dotenv from 'dotenv';
 import { z } from 'zod';
 import { API_Rate_Limiter } from '@thinkeloquent/npm-api-rate-limiter';
-import { CLIProgressHelper, ProgressBar, Colors } from '@thinkeloquent/cli-progressor';
-import dotenv from 'dotenv';
+import { ProgressBar, CLIProgressHelper, Colors } from '@thinkeloquent/cli-progressor';
 
 // Load environment variables
 dotenv.config();
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 // Validation schemas
 const UserSchema = z.object({
-  username: z.string().min(1),
-  email: z.string().email().optional(),
-  name: z.string().optional()
+  username: z.string().optional(),
+  user: z.string().optional(),
+  name: z.string().optional(),
+  email: z.string().optional(),
+}).refine(data => data.username || data.user || data.name, {
+  message: "At least one of 'username', 'user', or 'name' must be provided"
 });
 
 const RepositorySchema = z.object({
+  id: z.number(),
   name: z.string(),
-  fullName: z.string(),
+  full_name: z.string(),
   private: z.boolean(),
-  owner: z.string(),
+  owner: z.object({
+    login: z.string(),
+    type: z.string(),
+  }),
+  html_url: z.string(),
   description: z.string().nullable(),
+  created_at: z.string(),
+  updated_at: z.string(),
+  pushed_at: z.string().nullable(),
   language: z.string().nullable(),
-  stars: z.number(),
-  forks: z.number(),
-  createdAt: z.string(),
-  updatedAt: z.string(),
-  url: z.string()
+  stargazers_count: z.number(),
+  watchers_count: z.number(),
+  forks_count: z.number(),
 });
 
-const ReportSchema = z.object({
-  inputs: z.object({
-    csvFile: z.string().optional(),
-    searchUser: z.string().optional(),
-    format: z.string(),
-    start: z.string(),
-    end: z.string()
-  }),
-  metaTags: z.record(z.string()),
-  summary: z.object({
-    totalUsers: z.number(),
-    totalRepositories: z.number(),
-    publicRepos: z.number(),
-    privateRepos: z.number(),
-    organizationRepos: z.number(),
-    personalRepos: z.number()
-  }),
-  users: z.array(z.object({
-    username: z.string(),
-    profile: z.object({
-      name: z.string().nullable(),
-      email: z.string().nullable(),
-      company: z.string().nullable()
-    }),
-    repositories: z.array(RepositorySchema),
-    repositoryStats: z.object({
-      total: z.number(),
-      public: z.number(),
-      private: z.number(),
-      byLanguage: z.record(z.number())
-    })
-  })),
-  criteria: z.array(z.string()),
-  formula: z.array(z.string()),
-  insights: z.array(z.string())
-});
+/**
+ * Streaming JSON Writer - handles real-time JSON streaming with proper array formatting
+ */
+class StreamingJsonWriter {
+  constructor(filePath) {
+    this.filePath = filePath;
+    this.stream = null;
+    this.isFirstItem = true;
+    this.isOpen = false;
+  }
 
-class AssociatedRepos {
+  async open(metadata = {}) {
+    this.stream = createWriteStream(this.filePath, { flags: 'w' });
+    this.isOpen = true;
+    
+    // Write opening structure with metadata
+    const opening = {
+      ...metadata,
+      users: []
+    };
+    
+    const openingStr = JSON.stringify(opening, null, 2);
+    // Remove the closing bracket and users array closing to prepare for streaming
+    const modifiedOpening = openingStr.replace(/,\s*"users":\s*\[\s*\]\s*}$/, ',\n  "users": [');
+    
+    await this.writeToStream(modifiedOpening);
+    this.isFirstItem = true;
+  }
+
+  async writeUser(userData) {
+    if (!this.isOpen) throw new Error('StreamingJsonWriter not opened');
+    
+    const prefix = this.isFirstItem ? '\n    ' : ',\n    ';
+    const userJson = JSON.stringify(userData, null, 4);
+    // Indent the JSON properly for array formatting
+    const indentedJson = userJson.replace(/\n/g, '\n    ');
+    
+    await this.writeToStream(prefix + indentedJson);
+    this.isFirstItem = false;
+  }
+
+  async close() {
+    if (!this.isOpen) return;
+    
+    // Close the users array and main object
+    await this.writeToStream('\n  ]\n}');
+    
+    return new Promise((resolve, reject) => {
+      this.stream.end((error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  }
+
+  writeToStream(data) {
+    return new Promise((resolve, reject) => {
+      this.stream.write(data, 'utf8', (error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  }
+}
+
+/**
+ * Streaming CSV Writer - handles real-time CSV streaming
+ */
+class StreamingCsvWriter {
+  constructor(filePath, headers) {
+    this.filePath = filePath;
+    this.headers = headers;
+    this.stream = null;
+    this.csvStream = null;
+    this.isOpen = false;
+  }
+
+  async open() {
+    this.stream = createWriteStream(this.filePath, { flags: 'w' });
+    this.csvStream = stringify({ 
+      header: true, 
+      columns: this.headers,
+      quoted_string: true 
+    });
+    
+    this.csvStream.pipe(this.stream);
+    this.isOpen = true;
+  }
+
+  async writeRow(rowData) {
+    if (!this.isOpen) throw new Error('StreamingCsvWriter not opened');
+    
+    return new Promise((resolve, reject) => {
+      this.csvStream.write(rowData, (error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  }
+
+  async close() {
+    if (!this.isOpen) return;
+    
+    return new Promise((resolve, reject) => {
+      this.csvStream.end((error) => {
+        this.stream.end(() => {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
+    });
+  }
+}
+
+/**
+ * Progress Checkpoint Manager - handles resume capability
+ */
+class ProgressCheckpoint {
+  constructor(checkpointFile) {
+    this.checkpointFile = checkpointFile;
+  }
+
+  async save(progress) {
+    const checkpoint = {
+      timestamp: new Date().toISOString(),
+      ...progress
+    };
+    await fs.promises.writeFile(this.checkpointFile, JSON.stringify(checkpoint, null, 2));
+  }
+
+  async load() {
+    try {
+      const data = await fs.promises.readFile(this.checkpointFile, 'utf8');
+      return JSON.parse(data);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  async clear() {
+    try {
+      await fs.promises.unlink(this.checkpointFile);
+    } catch (error) {
+      // Ignore if file doesn't exist
+    }
+  }
+}
+
+class AssociatedRepositoriesAnalyzer {
   constructor(options = {}) {
     this.options = {
       ...options,
       token: options.token || process.env.GITHUB_TOKEN,
       baseURL: options.baseURL || process.env.GITHUB_BASE_API_URL || 'https://api.github.com',
       verbose: options.verbose || false,
-      debug: options.debug || false
+      debug: options.debug || false,
     };
 
     if (!this.options.token) {
       throw new Error('GitHub token is required. Set GITHUB_TOKEN environment variable or use --token');
     }
 
-    this.octokit = new Octokit({
+    this.octokit = new Octokit({ 
       auth: this.options.token,
       baseUrl: this.options.baseURL
     });
 
-    // Initialize rate limiters for different GitHub API resources
-    this.setupRateLimiters();
-    
-    this.apiCalls = [];
+    this.apiCallCount = 0;
+    this.apiPaths = new Set();
     this.errors = [];
-    this.logFile = this.options.debug ? 'github.log' : null;
-  }
+    this.auditData = [];
 
-  setupRateLimiters() {
-    // Core API limiter (repositories, users, etc.)
-    this.coreLimiter = new API_Rate_Limiter('github-core-repos', {
-      getRateLimitStatus: () => this.getGitHubRateLimit('core')
+    // Rate limiters for different GitHub API endpoints
+    this.coreLimiter = new API_Rate_Limiter("github-core-streaming", {
+      getRateLimitStatus: () => this.getGitHubRateLimit("core")
     });
 
-    // Search API limiter (searching repositories)
-    this.searchLimiter = new API_Rate_Limiter('github-search-repos', {
-      getRateLimitStatus: () => this.getGitHubRateLimit('search')
+    this.searchLimiter = new API_Rate_Limiter("github-search-streaming", {
+      getRateLimitStatus: () => this.getGitHubRateLimit("search")
     });
+
+    // Global data loading
+    if (this.options.loadData) {
+      try {
+        const loadedData = JSON.parse(fs.readFileSync(this.options.loadData, 'utf8'));
+        this.LOAD_DATA = loadedData;
+        if (this.options.verbose) {
+          console.log(chalk.blue(`📂 Loaded data from ${this.options.loadData}`));
+        }
+      } catch (error) {
+        console.warn(chalk.yellow(`⚠️  Warning: Could not load data from ${this.options.loadData}: ${error.message}`));
+        this.LOAD_DATA = {};
+      }
+    } else {
+      this.LOAD_DATA = {};
+    }
+
+    // Setup logging
+    if (this.options.verbose || this.options.debug) {
+      this.logFile = path.join(this.options.outputDir || './output', 'github.log');
+      this.initializeLogging();
+    }
   }
 
-  async getGitHubRateLimit(resource = 'core') {
+  initializeLogging() {
+    const logDir = path.dirname(this.logFile);
+    if (!fs.existsSync(logDir)) {
+      fs.mkdirSync(logDir, { recursive: true });
+    }
+    
+    // Clear previous log
+    fs.writeFileSync(this.logFile, `=== GitHub API Log - ${new Date().toISOString()} ===\n`);
+  }
+
+  log(message, level = 'info') {
+    const timestamp = new Date().toISOString();
+    const logMessage = `[${timestamp}] [${level.toUpperCase()}] ${message}\n`;
+    
+    if (this.options.verbose || this.options.debug) {
+      fs.appendFileSync(this.logFile, logMessage);
+    }
+    
+    if (this.options.verbose && level !== 'debug') {
+      console.log(chalk.gray(`🔍 ${message}`));
+    }
+  }
+
+  async getGitHubRateLimit(resource = "core") {
     try {
-      const response = await this.octokit.request('GET /rate_limit');
-      const limit = response.data.resources[resource];
-      return {
-        remaining: limit.remaining,
-        reset: limit.reset
-      };
+      const response = await this.octokit.rest.rateLimit.get();
+      return response.data.resources[resource];
     } catch (error) {
-      console.error(`Failed to get rate limit for ${resource}:`, error.message);
+      this.log(`Failed to fetch rate limit for ${resource}: ${error.message}`, 'error');
       return { remaining: 1, reset: Math.floor(Date.now() / 1000) + 60 };
     }
   }
 
-  logRequest(method, url, response = null, error = null) {
-    const logEntry = {
-      timestamp: new Date().toISOString(),
-      method,
-      url,
-      response: response ? { status: response.status, data: response.data } : null,
-      error: error ? error.message : null
-    };
-
-    this.apiCalls.push({ method, url });
+  async makeRequest(url, options = {}) {
+    this.apiCallCount++;
+    const apiPath = url.replace(this.options.baseURL, '');
+    this.apiPaths.add(apiPath);
     
-    if (error) {
-      this.errors.push(logEntry);
-    }
-
-    if (this.options.verbose) {
-      console.log(chalk.gray(`API Call: ${method} ${url}`));
-    }
-
-    if (this.logFile) {
-      const logLine = JSON.stringify(logEntry) + '\n';
-      try {
-        fs.appendFileSync(this.logFile, logLine);
-      } catch (err) {
-        console.error('Failed to write to log file:', err.message);
-      }
-    }
-  }
-
-  async makeRequest(endpoint, options = {}) {
-    const url = endpoint.startsWith('http') ? endpoint : `${this.options.baseURL}${endpoint}`;
+    this.log(`API Request: ${apiPath}`, 'debug');
     
     try {
-      const response = await this.octokit.request(`GET ${endpoint}`, options);
-      this.logRequest('GET', url, response);
-      return response.data;
+      const response = await fetch(url, {
+        headers: {
+          'Authorization': `token ${this.options.token}`,
+          'Accept': 'application/vnd.github.v3+json',
+          'User-Agent': 'AssociatedRepositoriesAnalyzer/1.0',
+          ...options.headers
+        },
+        ...options
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      
+      if (this.options.debug) {
+        this.auditData.push({
+          timestamp: new Date().toISOString(),
+          url,
+          status: response.status,
+          data
+        });
+      }
+
+      this.log(`API Response: ${apiPath} - Status: ${response.status}`, 'debug');
+      return data;
     } catch (error) {
-      this.logRequest('GET', url, null, error);
+      this.log(`API Error: ${apiPath} - ${error.message}`, 'error');
+      this.errors.push({ url, error: error.message, timestamp: new Date().toISOString() });
       throw error;
     }
   }
 
   async validateUser(username) {
-    try {
-      const userData = await this.coreLimiter.schedule(async () => {
-        return this.makeRequest(`/users/${username}`);
-      });
-      
-      return {
-        username: userData.login,
-        name: userData.name,
-        email: userData.email,
-        company: userData.company,
-        publicRepos: userData.public_repos,
-        followers: userData.followers,
-        following: userData.following
-      };
-    } catch (error) {
-      if (error.status === 404) {
-        throw new Error(`User '${username}' not found`);
+    return this.coreLimiter.schedule(async () => {
+      try {
+        const user = await this.makeRequest(`${this.options.baseURL}/users/${username}`);
+        this.log(`User validated: ${username}`);
+        return user;
+      } catch (error) {
+        this.log(`User validation failed for ${username}: ${error.message}`, 'error');
+        throw error;
       }
-      throw error;
-    }
+    });
   }
 
-  async getUserRepositories(username, options = {}) {
-    const { start, end, org, repoFilter, ignoreDateRange, totalRecords } = options;
-    let allRepos = [];
+  async getUserRepositories(username) {
+    const repositories = {
+      owned: [],
+      contributed: [],
+      organizations: []
+    };
 
-    try {
-      // Get user's own repositories
-      await CLIProgressHelper.withProgress(
-        1,
-        `Fetching repositories for user: ${username}`,
-        async (updateProgress) => {
-          let page = 1;
-          const perPage = 100;
-          let hasMore = true;
-          let repoCount = 0;
-
-          while (hasMore && (totalRecords === 0 || repoCount < totalRecords)) {
-            const repos = await this.coreLimiter.schedule(async () => {
-              return this.makeRequest(`/users/${username}/repos`, {
-                page,
-                per_page: perPage,
-                sort: 'updated',
-                direction: 'desc'
-              });
-            });
-
-            if (repos.length === 0) {
-              hasMore = false;
-              break;
-            }
-
-            // Filter repositories based on criteria
-            const filteredRepos = this.filterRepositories(repos, {
-              start,
-              end,
-              org,
-              repoFilter,
-              ignoreDateRange
-            });
-
-            allRepos.push(...filteredRepos);
-            repoCount += filteredRepos.length;
-            page++;
-
-            if (repos.length < perPage) {
-              hasMore = false;
-            }
-
-            // Add delay to respect rate limits
-            await this.delay(this.options.delay || 2);
-          }
-
-          updateProgress(1);
-        }
-      );
-
-      // Search for repositories where user is a contributor
-      const contributedRepos = await this.searchUserContributions(username, options);
-      
-      // Merge and deduplicate repositories
-      const repoMap = new Map();
-      [...allRepos, ...contributedRepos].forEach(repo => {
-        repoMap.set(repo.full_name, repo);
-      });
-
-      return Array.from(repoMap.values()).map(repo => this.formatRepository(repo));
-    } catch (error) {
-      console.error(chalk.red(`Failed to fetch repositories for ${username}: ${error.message}`));
-      return [];
-    }
-  }
-
-  async searchUserContributions(username, options = {}) {
-    const { start, end, ignoreDateRange } = options;
-    let contributedRepos = [];
-
-    try {
-      // Search for repositories where user has commits
-      const queries = [
-        `author:${username}`,
-        `committer:${username}`
-      ];
-
-      if (!ignoreDateRange && start && end) {
-        queries.forEach((query, index) => {
-          queries[index] = `${query}+committer-date:${start}..${end}`;
-        });
-      }
-
-      for (const query of queries) {
-        await CLIProgressHelper.withProgress(
-          1,
-          `Searching contributions: ${query}`,
-          async (updateProgress) => {
-            try {
-              // Use time-based partitioning to handle >1000 results
-              const repos = await this.searchWithPartitioning(query, 'repositories');
-              contributedRepos.push(...repos);
-              updateProgress(1);
-            } catch (error) {
-              console.error(chalk.red(`Search failed for query "${query}": ${error.message}`));
-            }
-          }
-        );
-      }
-
-      return contributedRepos;
-    } catch (error) {
-      console.error(chalk.red(`Failed to search contributions for ${username}: ${error.message}`));
-      return [];
-    }
-  }
-
-  async searchWithPartitioning(baseQuery, type = 'repositories') {
-    const results = [];
-    const currentDate = new Date();
-    const oneYearAgo = new Date(currentDate.getFullYear() - 1, currentDate.getMonth(), currentDate.getDate());
-    
-    // Partition by months to handle >1000 result limit
-    const months = [];
-    let current = new Date(oneYearAgo);
-    
-    while (current <= currentDate) {
-      const start = new Date(current);
-      const end = new Date(current.getFullYear(), current.getMonth() + 1, 0);
-      if (end > currentDate) end.setTime(currentDate.getTime());
-      
-      months.push({
-        start: start.toISOString().split('T')[0],
-        end: end.toISOString().split('T')[0]
-      });
-      
-      current.setMonth(current.getMonth() + 1);
-    }
-
-    for (const month of months) {
-      const query = `${baseQuery}+created:${month.start}..${month.end}`;
-      
+    // Fetch owned repositories
+    await this.coreLimiter.schedule(async () => {
       try {
         let page = 1;
         let hasMore = true;
         
         while (hasMore) {
-          const response = await this.searchLimiter.schedule(async () => {
-            return this.makeRequest('/search/repositories', {
-              q: query,
-              page,
-              per_page: 100,
-              sort: 'updated',
-              order: 'desc'
-            });
-          });
-
-          results.push(...response.items);
+          const repos = await this.makeRequest(
+            `${this.options.baseURL}/users/${username}/repos?per_page=100&page=${page}&type=all&sort=updated`
+          );
           
-          if (response.items.length < 100 || results.length >= response.total_count) {
+          if (repos.length === 0) {
             hasMore = false;
           } else {
+            repositories.owned.push(...repos.map(repo => this.formatRepository(repo)));
             page++;
+            
+            if (this.options.totalRecords > 0 && repositories.owned.length >= this.options.totalRecords) {
+              repositories.owned = repositories.owned.slice(0, this.options.totalRecords);
+              hasMore = false;
+            }
           }
-
-          // Add delay for search API rate limiting
-          await this.delay(this.options.delay || 6);
         }
-      } catch (error) {
-        console.error(chalk.yellow(`Warning: Search failed for ${query}: ${error.message}`));
-      }
-    }
-
-    return results;
-  }
-
-  filterRepositories(repos, options = {}) {
-    const { start, end, org, repoFilter, ignoreDateRange } = options;
-    
-    return repos.filter(repo => {
-      // Organization filter
-      if (org && repo.owner.login !== org) {
-        return false;
-      }
-
-      // Repository name filter
-      if (repoFilter) {
-        const repoNames = repoFilter.split(',').map(name => name.trim());
-        if (!repoNames.includes(repo.name)) {
-          return false;
-        }
-      }
-
-      // Date range filter
-      if (!ignoreDateRange && start && end) {
-        const repoDate = new Date(repo.created_at);
-        const startDate = new Date(start);
-        const endDate = new Date(end);
         
-        if (repoDate < startDate || repoDate > endDate) {
-          return false;
-        }
+        this.log(`Found ${repositories.owned.length} owned repositories for ${username}`);
+      } catch (error) {
+        this.log(`Failed to fetch owned repositories for ${username}: ${error.message}`, 'error');
       }
-
-      return true;
     });
+
+    // Fetch organizations and their repositories
+    await this.coreLimiter.schedule(async () => {
+      try {
+        const orgs = await this.makeRequest(`${this.options.baseURL}/users/${username}/orgs`);
+        
+        for (const org of orgs) {
+          try {
+            let page = 1;
+            let hasMore = true;
+            
+            while (hasMore) {
+              const orgRepos = await this.makeRequest(
+                `${this.options.baseURL}/orgs/${org.login}/repos?per_page=100&page=${page}&type=all`
+              );
+              
+              if (orgRepos.length === 0) {
+                hasMore = false;
+              } else {
+                repositories.organizations.push(...orgRepos.map(repo => ({
+                  ...this.formatRepository(repo),
+                  organization: org.login
+                })));
+                page++;
+                
+                if (this.options.totalRecords > 0 && repositories.organizations.length >= this.options.totalRecords) {
+                  repositories.organizations = repositories.organizations.slice(0, this.options.totalRecords);
+                  hasMore = false;
+                  break;
+                }
+              }
+            }
+          } catch (error) {
+            this.log(`Failed to fetch repositories for org ${org.login}: ${error.message}`, 'error');
+          }
+        }
+        
+        this.log(`Found ${repositories.organizations.length} organization repositories for ${username}`);
+      } catch (error) {
+        this.log(`Failed to fetch organizations for ${username}: ${error.message}`, 'error');
+      }
+    });
+
+    return repositories;
   }
 
   formatRepository(repo) {
-    return {
-      name: repo.name,
-      fullName: repo.full_name,
-      private: repo.private,
-      owner: repo.owner.login,
-      description: repo.description,
-      language: repo.language,
-      stars: repo.stargazers_count,
-      forks: repo.forks_count,
-      createdAt: repo.created_at,
-      updatedAt: repo.updated_at,
-      url: repo.html_url,
-      size: repo.size,
-      openIssues: repo.open_issues_count,
-      defaultBranch: repo.default_branch,
-      archived: repo.archived,
-      disabled: repo.disabled
-    };
-  }
-
-  parseCsvFile(filePath) {
     try {
-      const content = readFileSync(filePath, 'utf-8');
-      const lines = content.trim().split('\n');
-      const headers = lines[0].split(',').map(h => h.trim());
+      const validated = RepositorySchema.parse(repo);
       
-      const users = lines.slice(1).map(line => {
-        const values = line.split(',').map(v => v.trim());
-        const user = {};
-        
-        headers.forEach((header, index) => {
-          user[header] = values[index] || '';
-        });
-        
-        return user;
-      });
-
-      return users;
-    } catch (error) {
-      throw new Error(`Failed to parse CSV file: ${error.message}`);
-    }
-  }
-
-  calculateInsights(users) {
-    const insights = [];
-    const allRepos = users.flatMap(user => user.repositories);
-    
-    if (allRepos.length === 0) {
-      return ['No repositories found for analysis'];
-    }
-
-    // Language analysis
-    const languages = {};
-    allRepos.forEach(repo => {
-      if (repo.language) {
-        languages[repo.language] = (languages[repo.language] || 0) + 1;
-      }
-    });
-
-    const topLanguage = Object.entries(languages)
-      .sort(([,a], [,b]) => b - a)[0];
-    
-    if (topLanguage) {
-      insights.push(`Most popular language: ${topLanguage[0]} (${topLanguage[1]} repositories)`);
-    }
-
-    // Repository activity
-    const avgReposPerUser = (allRepos.length / users.length).toFixed(1);
-    insights.push(`Average repositories per user: ${avgReposPerUser}`);
-
-    // Stars and forks analysis
-    const totalStars = allRepos.reduce((sum, repo) => sum + repo.stars, 0);
-    const totalForks = allRepos.reduce((sum, repo) => sum + repo.forks, 0);
-    
-    if (totalStars > 0) {
-      insights.push(`Total stars across all repositories: ${totalStars}`);
-    }
-    
-    if (totalForks > 0) {
-      insights.push(`Total forks indicating collaboration: ${totalForks}`);
-    }
-
-    // Recent activity
-    const recentRepos = allRepos.filter(repo => {
-      const updated = new Date(repo.updatedAt);
-      const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-      return updated > thirtyDaysAgo;
-    });
-
-    insights.push(`${recentRepos.length} repositories updated in the last 30 days`);
-
-    return insights;
-  }
-
-  async generateReport(users, options) {
-    const { format, outputDir, filename, metaTags = {} } = options;
-    
-    // Calculate summary statistics
-    const allRepos = users.flatMap(user => user.repositories);
-    const publicRepos = allRepos.filter(repo => !repo.private).length;
-    const privateRepos = allRepos.filter(repo => repo.private).length;
-    const organizationRepos = allRepos.filter(repo => repo.owner !== repo.fullName.split('/')[0]).length;
-    const personalRepos = allRepos.length - organizationRepos;
-
-    const report = {
-      inputs: {
-        csvFile: options.csvFile,
-        searchUser: options.searchUser,
-        format: options.format,
-        start: options.start,
-        end: options.end,
-        org: options.org,
-        repo: options.repo
-      },
-      metaTags,
-      summary: {
-        totalUsers: users.length,
-        totalRepositories: allRepos.length,
-        publicRepos,
-        privateRepos,
-        organizationRepos,
-        personalRepos,
-        analysisDate: new Date().toISOString()
-      },
-      users,
-      criteria: [
-        'Repositories owned by user',
-        'Repositories where user is a contributor',
-        options.ignoreDateRange ? 'All time period' : `Date range: ${options.start} to ${options.end}`,
-        options.org ? `Organization filter: ${options.org}` : 'All organizations',
-        'Both public and private repositories included'
-      ],
-      formula: [
-        'Total repositories = owned repositories + contributed repositories (deduplicated)',
-        'Repository stats calculated per user',
-        'Language distribution based on primary repository language',
-        'Organization vs personal classification based on repository owner'
-      ],
-      insights: this.calculateInsights(users)
-    };
-
-    // Validate report structure
-    ReportSchema.parse(report);
-
-    // Ensure output directory exists
-    if (!existsSync(outputDir)) {
-      mkdirSync(outputDir, { recursive: true });
-    }
-
-    const timestamp = new Date().toISOString().split('T')[0];
-    const baseFilename = filename || `associated-repos-${timestamp}`;
-    const filePath = join(outputDir, `${baseFilename}.${format}`);
-
-    if (format === 'json') {
-      writeFileSync(filePath, JSON.stringify(report, null, 2));
-    } else if (format === 'csv') {
-      const csvContent = this.convertToCSV(report);
-      writeFileSync(filePath, csvContent);
-    }
-
-    // Generate audit file if debug mode is enabled
-    if (options.debug) {
-      const auditData = {
-        apiCalls: this.apiCalls,
-        errors: this.errors,
-        rateLimitCalls: await this.getRateLimitStatus(),
-        generatedAt: new Date().toISOString()
+      return {
+        id: validated.id,
+        name: validated.name,
+        fullName: validated.full_name,
+        private: validated.private,
+        owner: validated.owner.login,
+        ownerType: validated.owner.type,
+        htmlUrl: validated.html_url,
+        description: validated.description,
+        language: validated.language,
+        stars: validated.stargazers_count,
+        watchers: validated.watchers_count,
+        forks: validated.forks_count,
+        createdAt: validated.created_at,
+        updatedAt: validated.updated_at,
+        pushedAt: validated.pushed_at
       };
-      
-      const auditPath = join(outputDir, `${baseFilename}.audit.json`);
-      writeFileSync(auditPath, JSON.stringify(auditData, null, 2));
-      console.log(chalk.blue(`📄 Audit file saved: ${auditPath}`));
+    } catch (error) {
+      this.log(`Repository validation failed: ${error.message}`, 'error');
+      // Return minimal data if validation fails
+      return {
+        id: repo.id,
+        name: repo.name,
+        fullName: repo.full_name,
+        private: repo.private || false,
+        owner: repo.owner?.login || 'unknown',
+        ownerType: repo.owner?.type || 'unknown'
+      };
     }
-
-    return { filePath, report };
   }
 
-  convertToCSV(report) {
-    const headers = [
-      'Username', 'Name', 'Email', 'Company',
-      'Repository Name', 'Full Name', 'Private', 'Owner',
-      'Description', 'Language', 'Stars', 'Forks',
-      'Created At', 'Updated At', 'URL'
+  async readCsvFile(csvFile) {
+    const users = [];
+    
+    return new Promise((resolve, reject) => {
+      createReadStream(csvFile)
+        .pipe(parse({ 
+          columns: true, 
+          skip_empty_lines: true,
+          delimiter: ',',
+          trim: true 
+        }))
+        .on('data', (row) => {
+          try {
+            // Flexible mapping - look for username in various column names
+            const username = row.username || row.user || row.name || row.login || row.github_username;
+            
+            if (username) {
+              const validatedUser = UserSchema.parse({
+                username: username,
+                user: row.user,
+                name: row.name || row.display_name,
+                email: row.email
+              });
+              
+              // Include all additional CSV columns as metadata
+              const userData = {
+                username: username,
+                csvData: row
+              };
+              
+              users.push(userData);
+            }
+          } catch (error) {
+            this.log(`Invalid user data in CSV row: ${JSON.stringify(row)} - ${error.message}`, 'error');
+          }
+        })
+        .on('end', () => {
+          this.log(`Successfully read ${users.length} users from CSV file`);
+          resolve(users);
+        })
+        .on('error', (error) => {
+          this.log(`Failed to read CSV file: ${error.message}`, 'error');
+          reject(error);
+        });
+    });
+  }
+
+  async analyze(csvFile, options = {}) {
+    console.log(chalk.blue.bold('🔸 Initialization'));
+    console.log(chalk.green.bold('🔧 AssociatedRepositoriesAnalyzer initialized'));
+
+    // Display configuration
+    const config = [
+      ['📊 Rate limit', 'Dynamic'],
+      ['📁 CSV file', csvFile],
+      ['📅 Date range', options.ignoreDateRange ? 'Ignored' : `${options.start} to ${options.end}`],
+      ['🏢 Organization', options.org || 'All organizations'],
+      ['📂 Repositories', options.repo || 'All repositories'],
+      ['📄 Output format', options.format || 'JSON'],
+      ['💾 Output directory', options.outputDir || './output'],
+      ['🔍 Verbose mode', options.verbose ? 'Enabled' : 'Disabled'],
+      ['🐛 Debug mode', options.debug ? 'Enabled' : 'Disabled'],
+      ['📊 Total records limit', options.totalRecords || 'No limit'],
+      ['⏱️  API delay', `${options.delay || 6} seconds`],
+      ['🔄 Streaming', 'Enabled (real-time file writing)']
     ];
 
-    const rows = [headers.join(',')];
-
-    report.users.forEach(user => {
-      user.repositories.forEach(repo => {
-        const row = [
-          user.username,
-          user.profile.name || '',
-          user.profile.email || '',
-          user.profile.company || '',
-          repo.name,
-          repo.fullName,
-          repo.private,
-          repo.owner,
-          repo.description || '',
-          repo.language || '',
-          repo.stars,
-          repo.forks,
-          repo.createdAt,
-          repo.updatedAt,
-          repo.url
-        ].map(field => `"${String(field).replace(/"/g, '""')}"`);
-        
-        rows.push(row.join(','));
-      });
+    console.log('\nParameter            Value');
+    console.log('─'.repeat(50));
+    config.forEach(([param, value]) => {
+      console.log(`${param.padEnd(20)} ${value}`);
     });
 
-    return rows.join('\n');
-  }
+    console.log(chalk.blue.bold('\n🚀 Starting CSV-based repository analysis...'));
 
-  async delay(seconds) {
-    return new Promise(resolve => setTimeout(resolve, seconds * 1000));
-  }
-
-  async getRateLimitStatus() {
-    try {
-      const data = await this.makeRequest('/rate_limit');
-      return data.resources;
-    } catch (error) {
-      console.error(chalk.red('Failed to fetch rate limit status'));
-      return null;
+    // Setup output directory
+    const outputDir = options.outputDir || './output';
+    if (!fs.existsSync(outputDir)) {
+      fs.mkdirSync(outputDir, { recursive: true });
     }
+
+    // Setup checkpoint management
+    const checkpointFile = path.join(outputDir, '.checkpoint.json');
+    const checkpoint = new ProgressCheckpoint(checkpointFile);
+
+    // Read users from CSV
+    console.log(chalk.blue.bold('\n🔸 CSV Processing'));
+    const users = await this.readCsvFile(csvFile);
+    console.log(chalk.green(`📊 Loaded ${users.length} users from CSV`));
+
+    if (users.length === 0) {
+      throw new Error('No valid users found in CSV file');
+    }
+
+    // Check for resume capability
+    const existingProgress = await checkpoint.load();
+    let startIndex = 0;
+    
+    if (existingProgress && existingProgress.processedUsers) {
+      console.log(chalk.yellow(`🔄 Found previous progress: ${existingProgress.processedUsers} users processed`));
+      startIndex = existingProgress.processedUsers;
+    }
+
+    // Setup file paths
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const baseFilename = options.filename || `associated-repositories-${timestamp}`;
+    const outputFile = path.join(outputDir, `${baseFilename}.${options.format || 'json'}`);
+    const auditFile = path.join(outputDir, `${baseFilename}.audit.json`);
+
+    // Initialize streaming writers
+    let writer;
+    const format = options.format || 'json';
+    
+    if (format === 'json') {
+      writer = new StreamingJsonWriter(outputFile);
+      await writer.open({
+        inputs: {
+          csvFile: path.basename(csvFile),
+          format: format,
+          totalUsers: users.length,
+          outputDir: outputDir,
+          generatedAt: new Date().toISOString(),
+          ...options
+        },
+        metaTags: this.parseMetaTags(options.metaTags || []),
+        summary: {
+          totalUsers: users.length,
+          processedUsers: 0,
+          totalRepositories: 0,
+          successfulAnalyses: 0,
+          failedAnalyses: 0
+        }
+      });
+    } else {
+      const csvHeaders = [
+        'username', 'user_name', 'user_email', 'user_company', 'user_type',
+        'repo_name', 'repo_full_name', 'repo_private', 'repo_owner', 'repo_type',
+        'repo_language', 'repo_stars', 'repo_forks', 'repo_created_at',
+        'organization', 'association_type'
+      ];
+      writer = new StreamingCsvWriter(outputFile, csvHeaders);
+      await writer.open();
+    }
+
+    // Process users with streaming
+    console.log(chalk.blue.bold('\n🔸 Repository Analysis'));
+    
+    let processedUsers = startIndex;
+    let totalRepositories = 0;
+    let successfulAnalyses = 0;
+    let failedAnalyses = 0;
+
+    const remainingUsers = users.slice(startIndex);
+    
+    await CLIProgressHelper.withProgress(
+      remainingUsers.length,
+      'Analyzing user repositories',
+      async (updateProgress) => {
+        for (const [index, userData] of remainingUsers.entries()) {
+          const username = userData.username;
+          
+          try {
+            this.log(`Processing user: ${username}`);
+            
+            // Validate user exists
+            const githubUser = await this.validateUser(username);
+            
+            // Get all associated repositories
+            const repositories = await this.getUserRepositories(username);
+            
+            // Calculate totals
+            const totals = {
+              ownedCount: repositories.owned.length,
+              contributedCount: repositories.contributed.length,
+              organizationRepoCount: repositories.organizations.length,
+              totalRepoCount: repositories.owned.length + repositories.contributed.length + repositories.organizations.length
+            };
+            
+            totalRepositories += totals.totalRepoCount;
+
+            const userResult = {
+              user: username,
+              userData: {
+                login: githubUser.login,
+                id: githubUser.id,
+                name: githubUser.name,
+                email: githubUser.email,
+                company: githubUser.company,
+                location: githubUser.location,
+                bio: githubUser.bio,
+                publicRepos: githubUser.public_repos,
+                followers: githubUser.followers,
+                following: githubUser.following,
+                createdAt: githubUser.created_at,
+                updatedAt: githubUser.updated_at
+              },
+              csvData: userData.csvData,
+              repositories,
+              totals,
+              processedAt: new Date().toISOString()
+            };
+
+            // Stream to file immediately
+            if (format === 'json') {
+              await writer.writeUser(userResult);
+            } else {
+              // Write multiple CSV rows for each repository
+              const writeRepoRows = async (repos, associationType) => {
+                for (const repo of repos) {
+                  await writer.writeRow({
+                    username: username,
+                    user_name: githubUser.name || '',
+                    user_email: githubUser.email || '',
+                    user_company: githubUser.company || '',
+                    user_type: githubUser.type || '',
+                    repo_name: repo.name,
+                    repo_full_name: repo.fullName,
+                    repo_private: repo.private,
+                    repo_owner: repo.owner,
+                    repo_type: repo.ownerType,
+                    repo_language: repo.language || '',
+                    repo_stars: repo.stars || 0,
+                    repo_forks: repo.forks || 0,
+                    repo_created_at: repo.createdAt || '',
+                    organization: repo.organization || '',
+                    association_type: associationType
+                  });
+                }
+              };
+
+              await writeRepoRows(repositories.owned, 'owned');
+              await writeRepoRows(repositories.contributed, 'contributed');
+              await writeRepoRows(repositories.organizations, 'organization');
+            }
+
+            successfulAnalyses++;
+            processedUsers++;
+            
+            // Save checkpoint
+            await checkpoint.save({
+              processedUsers,
+              successfulAnalyses,
+              failedAnalyses,
+              totalRepositories
+            });
+
+            this.log(`Successfully processed ${username}: ${totals.totalRepoCount} repositories`);
+            
+          } catch (error) {
+            this.log(`Failed to process user ${username}: ${error.message}`, 'error');
+            failedAnalyses++;
+            processedUsers++;
+            
+            // Stream error record
+            if (format === 'json') {
+              await writer.writeUser({
+                user: username,
+                error: error.message,
+                processedAt: new Date().toISOString(),
+                csvData: userData.csvData
+              });
+            }
+          }
+          
+          updateProgress(1);
+          
+          // Respect delay between users
+          if (options.delay && index < remainingUsers.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, options.delay * 1000));
+          }
+        }
+      }
+    );
+
+    // Close streaming writer
+    await writer.close();
+
+    // Clean up checkpoint on successful completion
+    await checkpoint.clear();
+
+    console.log(chalk.blue.bold('\n📊 Processing Summary'));
+    console.log('─'.repeat(50));
+    console.log(`✅ Successfully processed  : ${successfulAnalyses} users`);
+    console.log(`❌ Failed to process       : ${failedAnalyses} users`);
+    console.log(`📊 Total users            : ${users.length} users`);
+    console.log(`📂 Total repositories     : ${totalRepositories} repos`);
+    console.log(`📈 Success rate           : ${((successfulAnalyses / users.length) * 100).toFixed(1)}%`);
+    console.log('─'.repeat(50));
+
+    // Generate audit file if debug mode
+    if (options.debug && this.auditData.length > 0) {
+      const auditData = {
+        generatedAt: new Date().toISOString(),
+        totalApiCalls: this.apiCallCount,
+        apiPaths: Array.from(this.apiPaths),
+        errors: this.errors,
+        requests: this.auditData
+      };
+      
+      await fs.promises.writeFile(auditFile, JSON.stringify(auditData, null, 2));
+      console.log(chalk.blue(`📄 Debug audit saved: ${auditFile}`));
+    }
+
+    // Final report generation
+    console.log(chalk.blue.bold('\n🔸 Report Generation'));
+    console.log(chalk.green(`📄 Report saved: ${outputFile}`));
+
+    // Show API usage summary
+    await this.showApiUsageSummary();
+    await this.showRateLimit();
+
+    console.log(chalk.green.bold('\n✅ Analysis completed successfully!'));
+
+    // Final summary
+    console.log(chalk.blue.bold('\n📊 Final Report Summary'));
+    console.log('─'.repeat(60));
+    console.log(`📊 Total Users Processed  : ${processedUsers}`);
+    console.log(`📂 Total Repositories     : ${totalRepositories}`);
+    console.log(`✅ Successful Analyses    : ${successfulAnalyses}`);
+    console.log(`❌ Failed Analyses        : ${failedAnalyses}`);
+    console.log(`📄 Report Location        : ${outputFile}`);
+    if (options.debug) {
+      console.log(`🔍 Audit File Location    : ${auditFile}`);
+    }
+    console.log('─'.repeat(60));
+
+    return {
+      totalUsers: users.length,
+      processedUsers,
+      totalRepositories,
+      successfulAnalyses,
+      failedAnalyses,
+      outputFile,
+      auditFile: options.debug ? auditFile : null
+    };
+  }
+
+  parseMetaTags(metaTags) {
+    const tags = {};
+    if (Array.isArray(metaTags)) {
+      metaTags.forEach(tag => {
+        const [key, value] = tag.split('=');
+        if (key && value) {
+          tags[key.trim()] = value.trim();
+        }
+      });
+    }
+    return tags;
+  }
+
+  async showApiUsageSummary() {
+    console.log(chalk.blue.bold('\n📊 GitHub API Usage Summary:'));
+    console.log('─'.repeat(60));
+    console.log(`Total API calls: ${this.apiCallCount}`);
+    console.log(`API paths used: ${Array.from(this.apiPaths).join(', ')}`);
   }
 
   async showRateLimit() {
     try {
-      const data = await this.makeRequest('/rate_limit');
+      const data = await this.makeRequest(`${this.options.baseURL}/rate_limit`);
       const { rate } = data;
 
-      console.log(chalk.blue.bold('\n📊 GitHub API Rate Limit Status:'));
+      console.log(chalk.blue.bold("\n📊 GitHub API Rate Limit Status:"));
       console.log(`   Limit: ${chalk.green.bold(rate.limit)}`);
       console.log(`   Remaining: ${chalk.green.bold(rate.remaining)}`);
       console.log(`   Used: ${chalk.yellow.bold(rate.used)}`);
-      console.log(`   Resets at: ${chalk.gray(new Date(rate.reset * 1000).toLocaleString())}`);
+      console.log(
+        `   Resets at: ${chalk.gray(new Date(rate.reset * 1000).toLocaleString())}`
+      );
 
       if (rate.remaining < 10) {
-        console.log(chalk.red.bold('   ⚠️  Warning: Rate limit is low!'));
+        console.log(chalk.red.bold("   ⚠️  Warning: Rate limit is low!"));
       }
     } catch (error) {
-      console.error(chalk.red('❌ Failed to fetch rate limit information'));
+      console.error(chalk.red("❌ Failed to fetch rate limit information"));
     }
-  }
-
-  displaySummary(options, report) {
-    console.log(chalk.blue.bold('\n🔸 Initialization'));
-    console.log(chalk.green('🔧 AssociatedRepos initialized'));
-    
-    console.log('\nParameter'.padEnd(25) + 'Value');
-    console.log('─'.repeat(50));
-    console.log(`📊 Rate limit`.padEnd(25) + chalk.green('Dynamic'));
-    console.log(`👤 Search user`.padEnd(25) + chalk.yellow(options.searchUser || 'From CSV'));
-    console.log(`📁 CSV file`.padEnd(25) + chalk.yellow(options.csvFile || 'Not specified'));
-    console.log(`📅 Date range`.padEnd(25) + chalk.yellow(`${options.start} to ${options.end}`));
-    console.log(`🏢 Organization`.padEnd(25) + chalk.yellow(options.org || 'All organizations'));
-    console.log(`📂 Repositories`.padEnd(25) + chalk.yellow(options.repo || 'All repositories'));
-    console.log(`📄 Output format`.padEnd(25) + chalk.yellow(options.format));
-    console.log(`💾 Output directory`.padEnd(25) + chalk.yellow(options.outputDir));
-    console.log(`🔍 Verbose mode`.padEnd(25) + chalk.yellow(options.verbose ? 'Enabled' : 'Disabled'));
-    console.log(`🐛 Debug mode`.padEnd(25) + chalk.yellow(options.debug ? 'Enabled' : 'Disabled'));
-
-    if (report) {
-      console.log(chalk.blue.bold('\n📊 Final Report Summary'));
-      console.log('─'.repeat(60));
-      console.log(`📊 Total Users`.padEnd(25) + `: ${chalk.green.bold(report.summary.totalUsers)}`);
-      console.log(`📂 Total Repositories`.padEnd(25) + `: ${chalk.green.bold(report.summary.totalRepositories)}`);
-      console.log(`🔓 Public Repositories`.padEnd(25) + `: ${chalk.green.bold(report.summary.publicRepos)}`);
-      console.log(`🔒 Private Repositories`.padEnd(25) + `: ${chalk.green.bold(report.summary.privateRepos)}`);
-      console.log(`🏢 Organization Repos`.padEnd(25) + `: ${chalk.green.bold(report.summary.organizationRepos)}`);
-      console.log(`👤 Personal Repos`.padEnd(25) + `: ${chalk.green.bold(report.summary.personalRepos)}`);
-      console.log('─'.repeat(60));
-    }
-
-    console.log(chalk.blue.bold('\n📊 GitHub API Usage Summary:'));
-    console.log(`Total API calls: ${this.apiCalls.length}`);
-    const uniquePaths = [...new Set(this.apiCalls.map(call => call.url))];
-    console.log(`API paths used: ${uniquePaths.join(', ')}`);
   }
 }
 
@@ -764,185 +884,74 @@ class AssociatedRepos {
 const program = new Command();
 
 program
-  .name('associated-repos')
-  .description('Query GitHub API to provide comprehensive list of associated repositories for users')
-  .version('1.0.0');
-
-program
-  .option('--csvFile <path>', 'Path to CSV file containing users to analyze')
-  .option('--searchUser <user>', 'Single user identifier to analyze (alternative to CSV)')
+  .name('associated-repositories-analyzer')
+  .description('Analyze GitHub users from CSV and discover all associated repositories')
+  .version('1.0.0')
+  .requiredOption('--csvFile <file>', 'Path to CSV file containing users to analyze')
   .option('--org <org>', 'GitHub organization to filter repositories')
   .option('--repo <repo>', 'Comma-separated list of specific repository names')
+  .option('--meta-tags <tags...>', 'Metadata tags in KEY=VALUE format', [])
   .option('--format <format>', 'Output format (json|csv)', 'json')
   .option('--outputDir <directory>', 'Directory to save files', './output')
   .option('--filename <filename>', 'Base name for output files')
-  .option('--ignoreDateRange', 'Ignore date range filters', false)
-  .option('--start <date>', 'Start date for analysis (YYYY-MM-DD)')
-  .option('--end <date>', 'End date for analysis (YYYY-MM-DD)')
+  .option('--ignoreDateRange', 'Ignore date range filtering', false)
+  .option('--start <date>', 'Start date (YYYY-MM-DD)')
+  .option('--end <date>', 'End date (YYYY-MM-DD)')
   .option('--token <token>', 'GitHub personal access token')
   .option('--verbose', 'Enable verbose logging', false)
-  .option('--debug', 'Enable debug mode with audit files', false)
+  .option('--debug', 'Enable debug logging with audit files', false)
   .option('--loadData <filepath>', 'Path to JSON file to load at runtime')
-  .option('--totalRecords <number>', 'Maximum total records to fetch (0 = no limit)', '0')
-  .option('--delay <seconds>', 'Delay between API requests in seconds', '2')
-  .option('--meta-tags <tags...>', 'Metadata tags in KEY=VALUE format')
-  .action(async (options) => {
-    try {
-      // Validate required arguments
-      if (!options.csvFile && !options.searchUser) {
-        console.error(chalk.red('❌ Error: Either --csvFile or --searchUser is required'));
-        process.exit(1);
-      }
+  .option('--totalRecords <number>', 'Maximum number of records to fetch (0 = no limit)', '0')
+  .option('--delay <seconds>', 'Delay between API requests in seconds', '6');
 
-      // Set default dates if not provided and not ignored
-      if (!options.ignoreDateRange) {
-        const now = new Date();
-        const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-        
-        options.start = options.start || thirtyDaysAgo.toISOString().split('T')[0];
-        options.end = options.end || now.toISOString().split('T')[0];
-
-        // Validate date format
-        const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
-        if (!dateRegex.test(options.start) || !dateRegex.test(options.end)) {
-          console.error(chalk.red('❌ Dates must be in YYYY-MM-DD format'));
-          process.exit(1);
-        }
-      }
-
-      // Parse meta tags
-      const metaTags = {};
-      if (options.metaTags) {
-        options.metaTags.forEach(tag => {
-          const [key, value] = tag.split('=');
-          if (key && value) {
-            metaTags[key] = value;
-          }
-        });
-      }
-
-      // Parse totalRecords
-      options.totalRecords = parseInt(options.totalRecords, 10);
-      options.delay = parseFloat(options.delay);
-
-      // Load additional data if specified
-      let LOAD_DATA = null;
-      if (options.loadData) {
-        try {
-          const loadDataContent = readFileSync(options.loadData, 'utf-8');
-          LOAD_DATA = JSON.parse(loadDataContent);
-        } catch (error) {
-          console.error(chalk.red(`❌ Failed to load data file: ${error.message}`));
-          process.exit(1);
-        }
-      }
-
-      // Initialize analyzer
-      const analyzer = new AssociatedRepos(options);
-      analyzer.displaySummary(options);
-
-      console.log(chalk.blue.bold('\n🚀 Starting GitHub repository analysis...'));
-
-      // Get users to analyze
-      let users = [];
-      if (options.csvFile) {
-        console.log(chalk.blue.bold('\n🔸 CSV File Processing'));
-        if (!existsSync(options.csvFile)) {
-          console.error(chalk.red(`❌ CSV file not found: ${options.csvFile}`));
-          process.exit(1);
-        }
-        
-        const csvUsers = analyzer.parseCsvFile(options.csvFile);
-        console.log(chalk.green(`📁 Loaded ${csvUsers.length} users from CSV`));
-        users = csvUsers.map(user => user.username || user.user || user.name).filter(Boolean);
-      } else {
-        users = [options.searchUser];
-      }
-
-      if (users.length === 0) {
-        console.error(chalk.red('❌ No valid users found to analyze'));
-        process.exit(1);
-      }
-
-      console.log(chalk.blue.bold('\n🔸 User Validation & Repository Analysis'));
-      
-      const analyzedUsers = [];
-      
-      await CLIProgressHelper.withProgress(
-        users.length,
-        'Analyzing users and their repositories',
-        async (updateProgress) => {
-          for (const username of users) {
-            try {
-              console.log(chalk.blue(`\n🔍 Analyzing user: ${username}`));
-              
-              // Validate user exists
-              const userProfile = await analyzer.validateUser(username);
-              console.log(chalk.green(`✅ User '${username}' validated`));
-
-              // Get user repositories
-              const repositories = await analyzer.getUserRepositories(username, options);
-              
-              // Calculate repository statistics
-              const repositoryStats = {
-                total: repositories.length,
-                public: repositories.filter(repo => !repo.private).length,
-                private: repositories.filter(repo => repo.private).length,
-                byLanguage: {}
-              };
-
-              repositories.forEach(repo => {
-                if (repo.language) {
-                  repositoryStats.byLanguage[repo.language] = 
-                    (repositoryStats.byLanguage[repo.language] || 0) + 1;
-                }
-              });
-
-              analyzedUsers.push({
-                username,
-                profile: userProfile,
-                repositories,
-                repositoryStats
-              });
-
-              console.log(chalk.green(`📂 Found ${repositories.length} repositories for ${username}`));
-              
-            } catch (error) {
-              console.error(chalk.red(`❌ Failed to analyze user ${username}: ${error.message}`));
-            }
-            
-            updateProgress(1);
-          }
-        }
-      );
-
-      console.log(chalk.blue.bold('\n🔸 Report Generation'));
-      
-      const { filePath, report } = await analyzer.generateReport(analyzedUsers, {
-        ...options,
-        metaTags
-      });
-
-      console.log(chalk.green(`📄 Report saved: ${filePath}`));
-      
-      // Show final summary
-      analyzer.displaySummary(options, report);
-      await analyzer.showRateLimit();
-      
-      console.log(chalk.green.bold('\n✅ Analysis completed successfully!'));
-
-    } catch (error) {
-      console.error(chalk.red(`❌ Error: ${error.message}`));
-      if (options.debug) {
-        console.error(error.stack);
-      }
-      process.exit(1);
+program.action(async (options) => {
+  try {
+    // Validate required CSV file
+    if (!fs.existsSync(options.csvFile)) {
+      throw new Error(`CSV file not found: ${options.csvFile}`);
     }
-  });
 
-// Handle the case where the script is run directly
+    // Set default dates if not provided and not ignoring date range
+    if (!options.ignoreDateRange) {
+      const now = new Date();
+      const thirtyDaysAgo = new Date(now.getTime() - (30 * 24 * 60 * 60 * 1000));
+      
+      options.start = options.start || thirtyDaysAgo.toISOString().split('T')[0];
+      options.end = options.end || now.toISOString().split('T')[0];
+
+      // Validate date format
+      const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+      if (!dateRegex.test(options.start) || !dateRegex.test(options.end)) {
+        throw new Error('Dates must be in YYYY-MM-DD format');
+      }
+    }
+
+    // Convert totalRecords to number
+    options.totalRecords = parseInt(options.totalRecords, 10);
+    options.delay = parseFloat(options.delay);
+
+    const analyzer = new AssociatedRepositoriesAnalyzer(options);
+    await analyzer.analyze(options.csvFile, options);
+
+  } catch (error) {
+    console.error(chalk.red(`❌ Error: ${error.message}`));
+    process.exit(1);
+  }
+});
+
+// Handle process termination gracefully
+process.on('SIGINT', () => {
+  console.log(chalk.yellow('\n🛑 Process interrupted. Progress has been saved to checkpoint file.'));
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log(chalk.yellow('\n🛑 Process terminated. Progress has been saved to checkpoint file.'));
+  process.exit(0);
+});
+
 if (import.meta.url === `file://${process.argv[1]}`) {
   program.parse();
 }
 
-export default AssociatedRepos;
+export default AssociatedRepositoriesAnalyzer;
