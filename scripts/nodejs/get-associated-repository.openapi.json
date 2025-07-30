@@ -1,0 +1,469 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Associated Repositories Analyzer API",
+    "description": "API specification for the GitHub Associated Repositories Analysis Report",
+    "version": "1.0.0",
+    "contact": {
+      "name": "NodeJS Class Architect",
+      "url": "https://github.com"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://api.github.com",
+      "description": "GitHub API Server"
+    }
+  ],
+  "paths": {
+    "/analysis/repositories": {
+      "post": {
+        "summary": "Analyze repositories for users from CSV",
+        "description": "Process a CSV file of users and return comprehensive repository analysis with streaming support",
+        "operationId": "analyzeRepositories",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnalysisRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful analysis",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalysisResponse"
+                }
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "description": "CSV format of the analysis results"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request parameters",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AnalysisRequest": {
+        "type": "object",
+        "required": ["csvFile"],
+        "properties": {
+          "csvFile": {
+            "type": "string",
+            "description": "Path to CSV file containing users to analyze"
+          },
+          "org": {
+            "type": "string",
+            "description": "GitHub organization to filter repositories"
+          },
+          "repo": {
+            "type": "string",
+            "description": "Comma-separated list of specific repository names"
+          },
+          "metaTags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Metadata tags in KEY=VALUE format"
+          },
+          "format": {
+            "type": "string",
+            "enum": ["json", "csv"],
+            "default": "json",
+            "description": "Output format"
+          },
+          "outputDir": {
+            "type": "string",
+            "default": "./output",
+            "description": "Directory to save files"
+          },
+          "filename": {
+            "type": "string",
+            "description": "Base name for output files"
+          },
+          "ignoreDateRange": {
+            "type": "boolean",
+            "default": false,
+            "description": "Ignore date range filtering"
+          },
+          "start": {
+            "type": "string",
+            "format": "date",
+            "description": "Start date (YYYY-MM-DD)"
+          },
+          "end": {
+            "type": "string",
+            "format": "date",
+            "description": "End date (YYYY-MM-DD)"
+          },
+          "verbose": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable verbose logging"
+          },
+          "debug": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable debug logging with audit files"
+          },
+          "totalRecords": {
+            "type": "integer",
+            "default": 0,
+            "description": "Maximum number of records to fetch (0 = no limit)"
+          },
+          "delay": {
+            "type": "number",
+            "default": 6,
+            "description": "Delay between API requests in seconds"
+          }
+        }
+      },
+      "AnalysisResponse": {
+        "type": "object",
+        "required": ["inputs", "summary", "users"],
+        "properties": {
+          "inputs": {
+            "$ref": "#/components/schemas/AnalysisInputs"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/AnalysisSummary"
+          },
+          "metaTags": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Custom metadata tags"
+          },
+          "users": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UserAnalysis"
+            }
+          }
+        }
+      },
+      "AnalysisInputs": {
+        "type": "object",
+        "properties": {
+          "csvFile": {
+            "type": "string",
+            "description": "Source CSV file name"
+          },
+          "format": {
+            "type": "string",
+            "enum": ["json", "csv"]
+          },
+          "totalUsers": {
+            "type": "integer",
+            "description": "Total number of users from CSV"
+          },
+          "outputDir": {
+            "type": "string"
+          },
+          "generatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "AnalysisSummary": {
+        "type": "object",
+        "properties": {
+          "totalUsers": {
+            "type": "integer",
+            "description": "Total number of users analyzed"
+          },
+          "processedUsers": {
+            "type": "integer",
+            "description": "Number of successfully processed users"
+          },
+          "totalRepositories": {
+            "type": "integer",
+            "description": "Total number of repositories found"
+          },
+          "successfulAnalyses": {
+            "type": "integer",
+            "description": "Number of successful user analyses"
+          },
+          "failedAnalyses": {
+            "type": "integer",
+            "description": "Number of failed user analyses"
+          }
+        }
+      },
+      "UserAnalysis": {
+        "type": "object",
+        "required": ["user", "userData", "repositories", "totals"],
+        "properties": {
+          "user": {
+            "type": "string",
+            "description": "GitHub username"
+          },
+          "userData": {
+            "$ref": "#/components/schemas/GitHubUser"
+          },
+          "csvData": {
+            "type": "object",
+            "description": "Original CSV row data",
+            "additionalProperties": true
+          },
+          "repositories": {
+            "$ref": "#/components/schemas/UserRepositories"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/RepositoryTotals"
+          },
+          "processedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "error": {
+            "type": "string",
+            "description": "Error message if processing failed"
+          }
+        }
+      },
+      "GitHubUser": {
+        "type": "object",
+        "properties": {
+          "login": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "email": {
+            "type": "string",
+            "nullable": true
+          },
+          "company": {
+            "type": "string",
+            "nullable": true
+          },
+          "location": {
+            "type": "string",
+            "nullable": true
+          },
+          "bio": {
+            "type": "string",
+            "nullable": true
+          },
+          "publicRepos": {
+            "type": "integer"
+          },
+          "followers": {
+            "type": "integer"
+          },
+          "following": {
+            "type": "integer"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "UserRepositories": {
+        "type": "object",
+        "required": ["owned", "contributed", "organizations"],
+        "properties": {
+          "owned": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Repository"
+            },
+            "description": "Repositories owned by the user"
+          },
+          "contributed": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Repository"
+            },
+            "description": "Repositories the user has contributed to"
+          },
+          "organizations": {
+            "type": "array",
+            "items": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/Repository"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "organization": {
+                      "type": "string",
+                      "description": "Organization name"
+                    }
+                  }
+                }
+              ]
+            },
+            "description": "Repositories from organizations the user belongs to"
+          }
+        }
+      },
+      "Repository": {
+        "type": "object",
+        "required": ["id", "name", "fullName", "private", "owner"],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "fullName": {
+            "type": "string"
+          },
+          "private": {
+            "type": "boolean"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "ownerType": {
+            "type": "string",
+            "enum": ["User", "Organization"]
+          },
+          "htmlUrl": {
+            "type": "string",
+            "format": "uri"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "language": {
+            "type": "string",
+            "nullable": true
+          },
+          "stars": {
+            "type": "integer"
+          },
+          "watchers": {
+            "type": "integer"
+          },
+          "forks": {
+            "type": "integer"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "pushedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        }
+      },
+      "RepositoryTotals": {
+        "type": "object",
+        "properties": {
+          "ownedCount": {
+            "type": "integer",
+            "description": "Number of owned repositories"
+          },
+          "contributedCount": {
+            "type": "integer",
+            "description": "Number of contributed repositories"
+          },
+          "organizationRepoCount": {
+            "type": "integer",
+            "description": "Number of organization repositories"
+          },
+          "totalRepoCount": {
+            "type": "integer",
+            "description": "Total number of associated repositories"
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": ["error", "message"],
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "code": {
+            "type": "integer"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "GitHubToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "GitHub Personal Access Token"
+      }
+    }
+  },
+  "security": [
+    {
+      "GitHubToken": []
+    }
+  ]
+}
