@@ -1,0 +1,451 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "GitHub Repository Search Terms Report API",
+    "description": "API specification for the GitHub Repository Search Terms analysis report output format",
+    "version": "1.0.0",
+    "contact": {
+      "name": "GitHub Repository Search Terms Analyzer",
+      "url": "https://github.com/your-org/github-repo-search-terms"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://api.github.com",
+      "description": "GitHub API"
+    }
+  ],
+  "paths": {},
+  "components": {
+    "schemas": {
+      "SearchTermsReport": {
+        "type": "object",
+        "description": "Complete search terms analysis report",
+        "required": ["inputs", "summary", "metaTags", "searches"],
+        "properties": {
+          "inputs": {
+            "$ref": "#/components/schemas/ReportInputs"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/ReportSummary"
+          },
+          "metaTags": {
+            "$ref": "#/components/schemas/MetaTags"
+          },
+          "searches": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SearchResult"
+            }
+          }
+        }
+      },
+      "ReportInputs": {
+        "type": "object",
+        "description": "Input parameters used for the analysis",
+        "required": ["searchTerms", "repositories", "contentTypes"],
+        "properties": {
+          "searchTerms": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Terms searched for across repositories"
+          },
+          "repositories": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Repository identifiers analyzed"
+          },
+          "contentTypes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": ["pulls", "issues", "commits", "code"]
+            },
+            "description": "Types of content searched"
+          },
+          "dateRange": {
+            "$ref": "#/components/schemas/DateRange"
+          },
+          "generatedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Timestamp when report was generated"
+          },
+          "format": {
+            "type": "string",
+            "enum": ["json", "csv"],
+            "description": "Output format of the report"
+          },
+          "totalRecords": {
+            "type": "integer",
+            "description": "Maximum number of records fetched per search"
+          }
+        }
+      },
+      "ReportSummary": {
+        "type": "object",
+        "description": "High-level summary of search results",
+        "required": ["totalSearches", "totalResults", "successfulSearches", "failedSearches"],
+        "properties": {
+          "totalSearches": {
+            "type": "integer",
+            "description": "Total number of searches performed"
+          },
+          "totalResults": {
+            "type": "integer",
+            "description": "Total number of results found across all searches"
+          },
+          "successfulSearches": {
+            "type": "integer",
+            "description": "Number of searches that completed successfully"
+          },
+          "failedSearches": {
+            "type": "integer",
+            "description": "Number of searches that failed"
+          }
+        }
+      },
+      "MetaTags": {
+        "type": "object",
+        "description": "Custom metadata tags provided via --meta-tags",
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "SearchResult": {
+        "type": "object",
+        "description": "Results for a specific term in a specific repository and content type",
+        "required": ["term", "repository", "contentType", "searchedAt"],
+        "properties": {
+          "term": {
+            "type": "string",
+            "description": "Search term used"
+          },
+          "repository": {
+            "type": "string",
+            "description": "Repository searched (owner/name format)"
+          },
+          "contentType": {
+            "type": "string",
+            "enum": ["pulls", "issues", "commits", "code"],
+            "description": "Type of content searched"
+          },
+          "results": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {"$ref": "#/components/schemas/PullRequestResult"},
+                {"$ref": "#/components/schemas/IssueResult"},
+                {"$ref": "#/components/schemas/CommitResult"},
+                {"$ref": "#/components/schemas/CodeResult"}
+              ]
+            },
+            "description": "Array of found results"
+          },
+          "totalResults": {
+            "type": "integer",
+            "description": "Number of results found for this search"
+          },
+          "searchedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Timestamp when search was performed"
+          },
+          "error": {
+            "type": "string",
+            "description": "Error message if search failed"
+          }
+        }
+      },
+      "PullRequestResult": {
+        "type": "object",
+        "description": "Pull request search result",
+        "required": ["id", "number", "title", "state", "author", "url", "createdAt", "contentType"],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "GitHub pull request ID"
+          },
+          "number": {
+            "type": "integer",
+            "description": "Pull request number"
+          },
+          "title": {
+            "type": "string",
+            "description": "Pull request title"
+          },
+          "body": {
+            "type": "string",
+            "nullable": true,
+            "description": "Pull request body/description"
+          },
+          "state": {
+            "type": "string",
+            "enum": ["open", "closed", "merged"],
+            "description": "Pull request state"
+          },
+          "author": {
+            "type": "string",
+            "description": "Pull request author username"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Pull request HTML URL"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Pull request creation timestamp"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Pull request last update timestamp"
+          },
+          "contentType": {
+            "type": "string",
+            "enum": ["pull_request"],
+            "description": "Content type identifier"
+          }
+        }
+      },
+      "IssueResult": {
+        "type": "object",
+        "description": "Issue search result",
+        "required": ["id", "number", "title", "state", "author", "url", "createdAt", "contentType"],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "GitHub issue ID"
+          },
+          "number": {
+            "type": "integer",
+            "description": "Issue number"
+          },
+          "title": {
+            "type": "string",
+            "description": "Issue title"
+          },
+          "body": {
+            "type": "string",
+            "nullable": true,
+            "description": "Issue body/description"
+          },
+          "state": {
+            "type": "string",
+            "enum": ["open", "closed"],
+            "description": "Issue state"
+          },
+          "author": {
+            "type": "string",
+            "description": "Issue author username"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Issue HTML URL"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Issue creation timestamp"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Issue last update timestamp"
+          },
+          "contentType": {
+            "type": "string",
+            "enum": ["issue"],
+            "description": "Content type identifier"
+          }
+        }
+      },
+      "CommitResult": {
+        "type": "object",
+        "description": "Commit search result",
+        "required": ["sha", "message", "author", "date", "url", "contentType"],
+        "properties": {
+          "sha": {
+            "type": "string",
+            "description": "Commit SHA hash"
+          },
+          "message": {
+            "type": "string",
+            "description": "Commit message"
+          },
+          "author": {
+            "$ref": "#/components/schemas/CommitAuthor"
+          },
+          "date": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Commit date"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Commit HTML URL"
+          },
+          "contentType": {
+            "type": "string",
+            "enum": ["commit"],
+            "description": "Content type identifier"
+          }
+        }
+      },
+      "CommitAuthor": {
+        "type": "object",
+        "description": "Commit author information",
+        "required": ["name", "email"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Author name"
+          },
+          "email": {
+            "type": "string",
+            "format": "email",
+            "description": "Author email"
+          },
+          "login": {
+            "type": "string",
+            "nullable": true,
+            "description": "GitHub username (if available)"
+          }
+        }
+      },
+      "CodeResult": {
+        "type": "object",
+        "description": "Code search result",
+        "required": ["name", "path", "sha", "url", "repository", "contentType"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "File name"
+          },
+          "path": {
+            "type": "string",
+            "description": "File path in repository"
+          },
+          "sha": {
+            "type": "string",
+            "description": "File SHA hash"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "File HTML URL"
+          },
+          "repository": {
+            "$ref": "#/components/schemas/CodeRepository"
+          },
+          "contentType": {
+            "type": "string",
+            "enum": ["code"],
+            "description": "Content type identifier"
+          }
+        }
+      },
+      "CodeRepository": {
+        "type": "object",
+        "description": "Repository information for code search result",
+        "required": ["id", "name", "fullName"],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "Repository ID"
+          },
+          "name": {
+            "type": "string",
+            "description": "Repository name"
+          },
+          "fullName": {
+            "type": "string",
+            "description": "Repository full name (owner/name)"
+          }
+        }
+      },
+      "DateRange": {
+        "type": "object",
+        "description": "Date range for filtering search results",
+        "properties": {
+          "start": {
+            "type": "string",
+            "format": "date",
+            "description": "Start date (YYYY-MM-DD)"
+          },
+          "end": {
+            "type": "string",
+            "format": "date",
+            "description": "End date (YYYY-MM-DD)"
+          }
+        }
+      },
+      "CSVRow": {
+        "type": "object",
+        "description": "CSV format row structure",
+        "properties": {
+          "search_term": {
+            "type": "string",
+            "description": "Search term used"
+          },
+          "repository": {
+            "type": "string",
+            "description": "Repository name"
+          },
+          "content_type": {
+            "type": "string",
+            "enum": ["pulls", "issues", "commits", "code"],
+            "description": "Content type searched"
+          },
+          "result_id": {
+            "type": "string",
+            "description": "Result identifier (ID, SHA, or name)"
+          },
+          "result_number": {
+            "type": "string",
+            "description": "Result number (for issues/PRs)"
+          },
+          "title": {
+            "type": "string",
+            "description": "Result title or message"
+          },
+          "body": {
+            "type": "string",
+            "description": "Result body or description"
+          },
+          "author": {
+            "type": "string",
+            "description": "Result author"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Result URL"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Creation timestamp"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Update timestamp"
+          },
+          "state": {
+            "type": "string",
+            "description": "Result state (for issues/PRs)"
+          }
+        }
+      }
+    }
+  }
+}
